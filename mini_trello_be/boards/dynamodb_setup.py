@@ -1,18 +1,44 @@
-"""Create the local demo table when missing; leave existing cards intact."""
-import boto3
+"""Create the card table when it is missing; leave existing cards intact.
 
-def ensure_card_table(resource=None):
-    if resource is None:
-        resource = boto3.resource('dynamodb', endpoint_url='http://dynamodb:8000', region_name='us-west-2', aws_access_key_id='dummy', aws_secret_access_key='dummy')
-    table = resource.Table('Card')
+Run before the API starts. DynamoDB Local can take a few seconds to accept
+connections, so the first call is retried.
+"""
+
+import os
+import time
+
+import django
+from botocore.exceptions import EndpointConnectionError
+
+TABLE_SPEC = {
+    "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+    "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+
+def ensure_card_table(table):
     try:
         table.load()
-        return table
-    except resource.meta.client.exceptions.ResourceNotFoundException:
-        table = resource.create_table(TableName='Card', KeySchema=[{'AttributeName':'id','KeyType':'HASH'}], AttributeDefinitions=[{'AttributeName':'id','AttributeType':'S'}], ProvisionedThroughput={'ReadCapacityUnits':10,'WriteCapacityUnits':10})
+    except table.meta.client.exceptions.ResourceNotFoundException:
+        table.meta.client.create_table(TableName=table.name, **TABLE_SPEC)
         table.wait_until_exists()
-        return table
+    return table
 
-if __name__ == '__main__':
-    ensure_card_table()
-    print('Local Card table is ready.')
+
+def wait_for_table(table, attempts=30, delay=1.0):
+    for attempt in range(1, attempts + 1):
+        try:
+            return ensure_card_table(table)
+        except EndpointConnectionError:
+            if attempt == attempts:
+                raise
+            time.sleep(delay)
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "mini_trello_be.settings")
+    django.setup()
+    from boards.models import card_table
+
+    print(f"Card table '{wait_for_table(card_table()).name}' is ready.")

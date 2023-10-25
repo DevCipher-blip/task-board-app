@@ -1,93 +1,136 @@
-import boto3
-from botocore.client import Config
+"""DynamoDB-backed card storage.
+
+Cards are not Django models: they live in a single DynamoDB table keyed by
+``id``. Each card carries a ``position`` number that orders it within its
+lane, so drag-and-drop order survives a reload.
+"""
+
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
+from decimal import Decimal
+from functools import lru_cache
 
-# Setup boto3 to use DynamoDB local
-boto3.setup_default_session(
-    aws_access_key_id='dummy',
-    aws_secret_access_key='dummy',
-    region_name='us-west-2'
-)
-dynamodb = boto3.resource('dynamodb', endpoint_url='http://dynamodb:8000', config=Config(signature_version='s3v4'))
+import boto3
+from botocore.exceptions import ClientError
+from django.conf import settings
 
-card_table = dynamodb.Table('Card')
+STATUSES = ("todo", "in-progress", "done")
+POSITION_STEP = Decimal(1024)
+# Below this gap two neighbours are too close to fit a midpoint, so the lane
+# is renumbered instead.
+MIN_POSITION_GAP = Decimal("0.000001")
+
+
+@lru_cache(maxsize=1)
+def card_table():
+    resource = boto3.resource(
+        "dynamodb",
+        endpoint_url=settings.DYNAMODB_ENDPOINT_URL or None,
+        region_name=settings.AWS_REGION,
+    )
+    return resource.Table(settings.DYNAMODB_TABLE)
+
+
+def _position(item):
+    # Cards saved before ordering existed have no position; they sort first.
+    return item.get("position", Decimal(0))
+
+
+def _sort_key(item):
+    return (_position(item), item.get("created_at", ""))
+
 
 class Card:
     @staticmethod
-    def create(title, description, status = 'todo'):
-        card_id = str(uuid.uuid4())
-        created_at = datetime.utcnow().isoformat()
-        card_table.put_item(
-            Item={
-                'id': card_id,
-                'title': title,
-                'description': description,
-                'status': status,
-                'created_at': created_at
-            }
-        )
-        return card_id
+    def create(title, description, status="todo"):
+        lane = Card.lane(status)
+        position = (_position(lane[-1]) if lane else 0) + POSITION_STEP
+        item = {
+            "id": str(uuid.uuid4()),
+            "title": title,
+            "description": description or "",
+            "status": status,
+            "position": position,
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        card_table().put_item(Item=item)
+        return item
 
     @staticmethod
     def get(card_id):
-        try:
-            response = card_table.get_item(Key={'id': card_id})
-            return response.get('Item')
-        except Exception as e:
-            print(f"An error occurred: {e}")
-            return None
-    
+        return card_table().get_item(Key={"id": card_id}).get("Item")
+
     @staticmethod
     def get_all():
-        try:
-            response = card_table.scan()
-            return response.get('Items', [])
-        except Exception as e:
-            print(f"An error occurred: {e}")
-            return None
+        """Every card, lane by lane, in board order.
+
+        A scan returns at most 1 MB per call, so follow LastEvaluatedKey until
+        the table is exhausted.
+        """
+        table = card_table()
+        response = table.scan()
+        items = response.get("Items", [])
+        while "LastEvaluatedKey" in response:
+            response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"])
+            items.extend(response.get("Items", []))
+        lane_order = {status: index for index, status in enumerate(STATUSES)}
+        return sorted(items, key=lambda item: (lane_order.get(item.get("status"), len(STATUSES)), *_sort_key(item)))
 
     @staticmethod
-    def update(card_id, title=None, description=None, status=None):
-        update_expression = 'SET '
-        expression_attribute_values = {}
-        expression_attribute_names = {}
-        update_expression_elements = []
+    def lane(status, exclude_id=None):
+        return [card for card in Card.get_all() if card.get("status") == status and card["id"] != exclude_id]
 
-        if title is not None:
-            update_expression_elements.append('#t = :t')
-            expression_attribute_values[':t'] = title
-            expression_attribute_names['#t'] = 'title'
-        if description is not None:
-            update_expression_elements.append('#d = :d')
-            expression_attribute_values[':d'] = description
-            expression_attribute_names['#d'] = 'description'
-        if status is not None:
-            update_expression_elements.append('#s = :s')
-            expression_attribute_values[':s'] = status
-            expression_attribute_names['#s'] = 'status'  # Use a placeholder for reserved keyword
-
-        update_expression += ', '.join(update_expression_elements)
-        
+    @staticmethod
+    def update(card_id, **fields):
+        """Set the given attributes on an existing card; None if it is missing."""
+        names = {f"#{name}": name for name in fields}
+        values = {f":{name}": value for name, value in fields.items()}
         try:
-            response = card_table.update_item(
-                Key={'id': card_id},
-                UpdateExpression=update_expression,
-                ExpressionAttributeValues=expression_attribute_values,
-                ExpressionAttributeNames=expression_attribute_names,
-                ReturnValues='UPDATED_NEW'
+            response = card_table().update_item(
+                Key={"id": card_id},
+                UpdateExpression="SET " + ", ".join(f"#{name} = :{name}" for name in fields),
+                # Without this condition DynamoDB would upsert a partial card.
+                ConditionExpression="attribute_exists(id)",
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+                ReturnValues="ALL_NEW",
             )
-            response = card_table.get_item(Key={'id': card_id})
-            return response.get('Item')
-        except Exception as e:
-            print(f"An error occurred: {e}")
+        except ClientError as error:
+            if error.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return None
+            raise
+        return response["Attributes"]
+
+    @staticmethod
+    def move(card_id, status, index):
+        """Place a card at ``index`` in the ``status`` lane (clamped to the lane)."""
+        if Card.get(card_id) is None:
             return None
+        lane = Card.lane(status, exclude_id=card_id)
+        index = max(0, min(index, len(lane)))
+        before = _position(lane[index - 1]) if index > 0 else None
+        after = _position(lane[index]) if index < len(lane) else None
+
+        if before is None and after is None:
+            position = POSITION_STEP
+        elif before is None:
+            position = after - POSITION_STEP
+        elif after is None:
+            position = before + POSITION_STEP
+        elif after - before > MIN_POSITION_GAP:
+            position = (before + after) / 2
+        else:
+            Card._renumber(lane)
+            return Card.move(card_id, status, index)
+        return Card.update(card_id, status=status, position=position)
+
+    @staticmethod
+    def _renumber(lane):
+        for offset, card in enumerate(lane, start=1):
+            Card.update(card["id"], position=POSITION_STEP * offset)
 
     @staticmethod
     def delete(card_id):
-        try:
-            response = card_table.delete_item(Key={'id': card_id})
-            return response
-        except Exception as e:
-            print(f"An error occurred: {e}")
-            return None
+        """Delete a card; True if it existed."""
+        response = card_table().delete_item(Key={"id": card_id}, ReturnValues="ALL_OLD")
+        return "Attributes" in response

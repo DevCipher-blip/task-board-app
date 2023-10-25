@@ -13,6 +13,11 @@ services:
     environment:
       DJANGO_SECRET_KEY: "${DJANGO_SECRET_KEY:-}"
       DJANGO_DEBUG: "${DJANGO_DEBUG:-1}"
+      DYNAMODB_ENDPOINT_URL: http://dynamodb:8000
+      # DynamoDB Local accepts any credentials; these never reach AWS.
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: us-west-2
     ports:
       - "127.0.0.1:8001:8001"
     depends_on:

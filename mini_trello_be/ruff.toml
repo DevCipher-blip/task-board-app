@@ -1,0 +1,7 @@
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I", "B", "UP"]
+# The formatter handles wrapping; long GraphQL strings in tests stay on one line.
+ignore = ["E501"]
