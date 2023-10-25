@@ -1,74 +1,158 @@
 # Mini board
 
-A small React/Apollo task board backed by a Django GraphQL endpoint and DynamoDB Local. Create a card, edit its description, move it between To-Do, In Progress, and Done, or delete it. It is one shared local board, not a multi-tenant project-management service.
+A small kanban board for one shared team space: three lanes (To do, In progress, Done), cards you can create, edit, delete and drag, and an order that survives a reload. The frontend is React, the API is Django serving GraphQL, and cards live in DynamoDB (DynamoDB Local in development).
 
-![Board interface with synthetic fixture cards](docs/screenshots/board.png)
+![The board with seeded demo cards](docs/screenshots/board-desktop.png)
 
+It is deliberately small. There are no accounts and no per-board permissions: everyone who can reach the API sees and edits the same cards. That makes it a good local planning board or a compact example of GraphQL over DynamoDB, not a hosted multi-tenant service.
 
-## How the parts connect
+## Run it
 
-```mermaid
-flowchart LR
-  UI[React drag-and-drop lanes] --> Apollo[Apollo query / mutations]
-  Apollo --> GraphQL[Django / Graphene endpoint]
-  GraphQL --> Cards[Card repository]
-  Cards --> Dynamo[(DynamoDB Local: Card table)]
-```
-
-Moving a card across lanes persists its status. Reordering within one lane is currently local UI state: there is no persisted position field. All clients share the same table and records; there is no implemented account or board ownership boundary.
-
-## Run the local stack
+You need Docker with Compose.
 
 ```sh
 docker compose up --build
 ```
 
-The frontend is at localhost:3000, GraphQL at localhost:8001/graphql, and DynamoDB Local at localhost:8000. Published ports bind to loopback. The supplied dummy AWS credentials target the local DynamoDB endpoint; no real AWS account or production credentials are required.
+- Board: http://localhost:3000
+- GraphQL API: http://localhost:8001/graphql (GraphiQL is served there while `DJANGO_DEBUG=1`)
 
-The table setup now checks for an existing `Card` table and leaves it intact, rather than failing each restart by trying to create it again. Docker/DynamoDB readiness and a full browser-to-database round trip were not exercised in this review. Container recreation can discard local DynamoDB state; this Compose file is a development demo, not a persistence/backup plan.
+DynamoDB Local runs in memory inside the stack, so cards disappear when its container is recreated. The API container creates the `Card` table on start (waiting for DynamoDB Local if needed) and leaves an existing table alone. The containers use placeholder AWS credentials that DynamoDB Local accepts; no AWS account is involved.
 
-The backend retains its declared Django 3.2-era dependency range. Its copied virtual environment, Python bytecode, and empty SQLite file have been removed. Build from the requirements instead of running an interpreter or dependency copied from another machine. Optional root `.env` settings are shown in [`.env.example`](.env.example): local debug mode can use a generated process-only signing key, while disabled debug mode requires a configured private key.
+Optional settings go in a root `.env` file; see [`.env.example`](.env.example). With the default `DJANGO_DEBUG=1` the API generates a throwaway signing key per process. Set `DJANGO_DEBUG=0` together with a real `DJANGO_SECRET_KEY` for anything beyond local use.
 
-## GraphQL, without a collection key
+## Using the board
 
-```graphql
-query {
-  allCards { id title description status }
-}
+- **New card** opens a form for a title (required, up to 200 characters), an optional description and the starting lane.
+- Drag cards within a lane to reorder them or into another lane at any position. Keyboard users can focus a card, press Space to lift it, move it with the arrow keys and press Space again to drop it.
+- The pencil button edits a card; the bin deletes it after a confirmation.
+- If the API is unreachable the board says so and offers a retry. A failed move puts the cards back in their saved order and shows a message.
+
+![Editing a card](docs/screenshots/card-dialog.png)
+
+<p align="center"><img src="docs/screenshots/board-mobile.png" alt="The board on a phone-sized screen, lanes stacked" width="300"></p>
+
+## How it fits together
+
+```mermaid
+flowchart LR
+  Browser -->|"/ (static bundle)"| Nginx[nginx, frontend container]
+  Browser -->|/graphql| Nginx
+  Nginx -->|proxy| API[Django + Graphene, gunicorn]
+  API -->|boto3| Dynamo[(DynamoDB Local: Card table)]
 ```
 
+The browser only ever talks to its own origin. nginx serves the built bundle and forwards `/graphql` to the API, and the Vite dev server does the same in development, so the frontend needs no CORS setup or hard-coded API host. The API still allows `http://localhost:3000` through django-cors-headers for direct calls; change it with `CORS_ALLOWED_ORIGINS`.
+
+### Card order
+
+Each card stores a numeric `position`. New cards go to the end of their lane (last position + 1024). `moveCard(cardId, status, index)` takes the lane and the slot the card was dropped into. The server looks up the neighbours at that slot and gives the card the midpoint of their positions, so a move writes one item. When two neighbours get too close to split (after many moves into the same gap), the lane is renumbered first. `allCards` returns cards lane by lane in position order.
+
+Cards saved before positions existed have none; they sort to the top of their lane and pick up a position the first time they are moved.
+
+### Why DynamoDB without Django models
+
+Cards are plain DynamoDB items behind a small `Card` class in `boards/models.py`. Django only provides the HTTP layer and settings, so there is no SQL database, admin or user model. Writes that must not create items use condition expressions: updating an unknown card id fails with "Card not found" instead of creating a partial card.
+
+## GraphQL API
+
+These were captured from the running stack. A card:
+
 ```graphql
-mutation {
-  createCard(title: "Synthetic task", description: "Example only", status: "todo") {
-    card { id title description status }
-  }
-}
+type CardType { id: String, title: String, description: String, status: String, position: Float }
 ```
 
-`updateCard(cardId: ..., title: ..., description: ..., status: ...)` updates supplied fields; an empty description can now clear existing text. `deleteCard(cardId: ...)` removes a card. Unknown card lookups return null, and invalid board states are rejected before storage. The old README's token-bearing Postman link is no longer needed for these examples.
+Statuses are `todo`, `in-progress` and `done`.
 
-## Interface details
-
-Lanes now show actual card counts. Edit/delete controls are keyboard-accessible buttons, modal fields have labels, the modal fits narrow screens, and cancelling an edit clears stale editor state before adding a new card. Card creation updates state immutably, avoiding duplicate inserts under React's development checks. Mutation failures have a visible message, and failed moves request a reload of saved state.
-
-## Checks
-
-From `mini_trello_fe/`:
+Create a card (it goes to the end of its lane):
 
 ```sh
-npm ci --ignore-scripts
-CI=true npm test -- --watchAll=false --runInBand
+curl -s http://localhost:8001/graphql -H 'Content-Type: application/json' -d '{
+  "query": "mutation($title: String!, $description: String, $status: String) { createCard(title: $title, description: $description, status: $status) { card { id title status position } } }",
+  "variables": {"title": "Draft the release notes", "description": "Pull highlights from this sprint'"'"'s merged work.", "status": "todo"}
+}'
+```
+
+```json
+{"data": {"createCard": {"card": {"id": "7d3541b2-d032-47c4-aa7f-52cf7377b425", "title": "Draft the release notes", "status": "todo", "position": 1024}}}}
+```
+
+Move a card to the top of the To do lane (`index` is the slot, 0 = top):
+
+```graphql
+mutation { moveCard(cardId: "1b05d7b1-a03f-44ff-9141-15a391ad43f9", status: "todo", index: 0) { card { title status position } } }
+```
+
+```json
+{"data": {"moveCard": {"card": {"title": "Book the design review", "status": "todo", "position": 0}}}}
+```
+
+Read the board, lane by lane in order:
+
+```graphql
+{ allCards { title status position } }
+```
+
+```json
+{"data": {"allCards": [
+  {"title": "Book the design review", "status": "todo", "position": 0},
+  {"title": "Draft the release notes", "status": "todo", "position": 1024},
+  {"title": "Audit empty-state copy", "status": "todo", "position": 2048},
+  {"title": "Persist card order", "status": "in-progress", "position": 1024},
+  {"title": "Keyboard drag support", "status": "in-progress", "position": 2048},
+  {"title": "Move the frontend to Vite", "status": "done", "position": 1024},
+  {"title": "Pin Python and Node versions", "status": "done", "position": 2048}
+]}}
+```
+
+Invalid input comes back as a GraphQL error and nothing is stored:
+
+```graphql
+mutation { createCard(title: "   ") { card { id } } }
+```
+
+```json
+{"errors": [{"message": "A card needs a title", "locations": [{"line": 1, "column": 12}], "path": ["createCard"]}], "data": {"createCard": null}}
+```
+
+Also available: `card(id: ID!)` returns one card or `null`, `updateCard(cardId, title, description, status)` edits text (a changed status appends the card to that lane), and `deleteCard(cardId)` returns `success: false` when the card did not exist.
+
+## Development
+
+The runtimes are pinned: Python 3.12 (`mini_trello_be/.python-version`) and Node 22.12 or newer (`mini_trello_fe/.nvmrc`, `engines`).
+
+Backend, from `mini_trello_be/`:
+
+```sh
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements-dev.txt
+ruff check . && ruff format --check .
+python manage.py test tests
+```
+
+The tests use [moto](https://github.com/getmoto/moto) as an in-memory DynamoDB, so they need neither Docker nor network access. They cover ordering and renumbering, cross-lane moves, the conditional update, scan pagination, validation, the table bootstrap and the HTTP endpoint, including CORS.
+
+To run the API outside Docker, start DynamoDB Local (`docker run -p 127.0.0.1:8000:8000 amazon/dynamodb-local:3.3.0`), then `python -m boards.dynamodb_setup` and `python manage.py runserver 8001`. Set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to any placeholder value if none are configured.
+
+Frontend, from `mini_trello_fe/`:
+
+```sh
+npm ci
+npm run dev      # http://localhost:3000, proxies /graphql to localhost:8001
+npm test         # Vitest + Testing Library
+npm run lint
 npm run build
 ```
 
-From `mini_trello_be/`, with compatible Graphene and boto3 installed:
+`API_PROXY_TARGET` changes where the dev server forwards `/graphql`, and `VITE_GRAPHQL_URL` points the built app at a different endpoint.
 
-```sh
-python -m unittest discover -s tests -v
-```
+## Limits
 
-Two UI tests cover the empty board/form and cancelled-edit reset. Five backend tests cover missing cards, invalid status, clearing descriptions, and existing/missing local table setup using SDK stubs. No real AWS request is made by those tests. The full Django HTTP stack, Docker runtime, live persistence, and drag/mutation concurrency remain unverified.
+- No authentication or per-board ownership. The GraphQL view is CSRF-exempt because it uses no cookies or sessions. Put it behind authentication before exposing it anywhere shared.
+- `allCards` scans the whole table and returns every card. That is fine for a team board and wrong for thousands of cards.
+- Moves are last-writer-wins. Two people dragging in the same lane at the same moment can end up with an order neither intended, though no card is lost.
+- The nginx and gunicorn containers are suitable for a local or internal deployment; there is no TLS, and DynamoDB Local is not persistent storage.
 
-The API is unauthenticated and its GraphQL view exempts CSRF protection. That fits only the explicit shared local demo. A hosted service needs authentication, per-board authorization, request limits, and stronger operational controls. Table scans currently read one response page; larger boards also need pagination and persisted ordering.
+## License
 
-The unreferenced root font folder was removed; the UI's Font Awesome SVG components remain. The credential-like collection key and former development signing-key bytes were removed from reachable branch history, along with committed runtime-environment/database artifacts. If an old credential was used with a real service, revoke it with its owner. A history rewrite cannot erase copies in caches, forks, or other checkouts.
+MIT, see [LICENSE](LICENSE).
