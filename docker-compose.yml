@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   frontend:
     build: ./mini_trello_fe
@@ -7,9 +5,9 @@ services:
       - "127.0.0.1:3000:3000"
     depends_on:
       - backend
+
   backend:
     build: ./mini_trello_be
-    command: python manage.py runserver 0.0.0.0:8001
     environment:
       DJANGO_SECRET_KEY: "${DJANGO_SECRET_KEY:-}"
       DJANGO_DEBUG: "${DJANGO_DEBUG:-1}"
@@ -22,7 +20,7 @@ services:
       - "127.0.0.1:8001:8001"
     depends_on:
       - dynamodb
+
+  # In-memory by default: cards are lost when this container is recreated.
   dynamodb:
-    image: amazon/dynamodb-local
-    ports:
-      - "127.0.0.1:8000:8000"
+    image: amazon/dynamodb-local:3.3.0

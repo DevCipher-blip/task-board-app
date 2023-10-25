@@ -4,3 +4,7 @@ __pycache__
 *.pyc
 *.sqlite3
 .env
+.env.*
+.ruff_cache
+tests
+requirements-dev.txt
