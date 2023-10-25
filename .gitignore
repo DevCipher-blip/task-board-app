@@ -1,0 +1,34 @@
+# Python
+env/
+.venv/
+venv/
+project_venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Databases and local state
+*.sqlite3
+*.db
+
+# Node
+node_modules/
+build/
+dist/
+coverage/
+.vite/
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Misc
+tmp/
+.DS_Store
+.github/
