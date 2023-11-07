@@ -1,6 +1,12 @@
-# Mini Trello
+# GraphQL task board
 
-Mini Trello is a simple Trello clone, allowing you to manage and organize tasks and projects with ease.
+## Trace a card move through the API
+
+The browser under [mini_trello_fe/](mini_trello_fe/) communicates with the backend under [mini_trello_be/](mini_trello_be/). Follow a card move from UI state through its GraphQL mutation and back to persisted board/list data.
+
+A virtual environment is generated state, so recreate it from the backend requirements rather than distributing it as source. For a stronger engineering walkthrough, demonstrate a failed mutation, reordering persistence, and access to another user's board; drag-and-drop alone does not establish consistency or authorization.
+
+For persistent Django sessions, supply `DJANGO_SECRET_KEY` (or `SECRET_KEY`) in the process environment. Local development uses a fresh temporary signing key when neither is set.
 
 ## Table of Contents
 
@@ -79,7 +85,7 @@ To run Mini Trello locally, you can use Docker Compose. Make sure you have the f
 1. Clone the Mini Trello repository:
 
    ```bash
-   git clone https://github.com/DevCipher-blip/task-board-app.git mini-trello
+   git clone https://github.com/DevCipher-blip/task-board-app.git
    cd mini-trello
    ```
 
